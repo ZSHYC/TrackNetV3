@@ -3,13 +3,14 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
+from collections import deque
 
 import torch
 from torch.utils.data import DataLoader
 
 from test import predict_location, get_ensemble_weight, generate_inpaint_mask
 from dataset import Shuttlecock_Trajectory_Dataset
-from utils.general import get_model, to_img_format, to_img, ResumeArgumentParser, HEIGHT, WIDTH, IMG_FORMAT, COOR_TH, write_pred_csv, write_pred_video
+from utils.general import get_model, to_img_format, to_img, ResumeArgumentParser, HEIGHT, WIDTH, IMG_FORMAT, COOR_TH, write_pred_csv, write_pred_video, draw_traj
 
 
 def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
@@ -117,6 +118,18 @@ def predict_from_images(image_dir, tracknet_file, inpaintnet_file='', batch_size
         img = Image.open(img_path)
         frame_list.append(np.array(img))
     
+    # 检查frame_list是否为空
+    if not frame_list or len(frame_list) == 0:
+        raise ValueError(f"No frames could be extracted from image directory: {image_dir}")
+    # 检查frame_list中的每一帧是否有效
+    for i, frame in enumerate(frame_list):
+        if frame is None:
+            raise ValueError(f"Frame {i} is None, image may be corrupted: {os.path.join(image_dir, image_files[i])}")
+    # 转换为numpy数组并检查维度
+    frame_array = np.array(frame_list)
+    if frame_array.ndim != 4:
+        raise ValueError(f"Expected 4D array for frames (N, H, W, C), but got {frame_array.ndim}D array with shape {frame_array.shape}. Image directory: {image_dir}")
+
     # 获取图像尺寸
     h, w = frame_list[0].shape[:2]
     w_scaler, h_scaler = w / WIDTH, h / HEIGHT
@@ -128,21 +141,75 @@ def predict_from_images(image_dir, tracknet_file, inpaintnet_file='', batch_size
     # 测试TrackNet
     tracknet.eval()
     seq_len = tracknet_seq_len
-    
-    # 创建数据集
-    dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=bg_mode,
+    if eval_mode == 'nonoverlap':
+        # Create dataset with non-overlap sampling
+        dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=bg_mode,
                                              frame_arr=np.array(frame_list)[:, :, :, ::-1], padding=True)
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    for step, (i, x) in enumerate(tqdm(data_loader)):
-        x = x.float().cuda()
-        with torch.no_grad():
-            y_pred = tracknet(x).detach().cpu()
-        
-        # 预测
-        tmp_pred = predict(i, y_pred=y_pred, img_scaler=img_scaler)
-        for key in tmp_pred.keys():
-            tracknet_pred_dict[key].extend(tmp_pred[key])
+        for step, (i, x) in enumerate(tqdm(data_loader)):
+            x = x.float().cuda()
+            with torch.no_grad():
+                y_pred = tracknet(x).detach().cpu()
+            
+            # 预测
+            tmp_pred = predict(i, y_pred=y_pred, img_scaler=img_scaler)
+            for key in tmp_pred.keys():
+                tracknet_pred_dict[key].extend(tmp_pred[key])
+    else:
+        # Create dataset with overlap sampling for temporal ensemble
+        dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='heatmap', bg_mode=bg_mode,
+                                            frame_arr=np.array(frame_list)[:, :, :, ::-1], padding=True)
+        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+        video_len = len(frame_list)
+        weight = get_ensemble_weight(seq_len, eval_mode)
+
+        # Init prediction buffer params
+        num_sample, sample_count = video_len-seq_len+1, 0
+        buffer_size = seq_len - 1
+        batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
+        frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
+        y_pred_buffer = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
+        for step, (i, x) in enumerate(tqdm(data_loader)):
+            x = x.float().cuda()
+            b_size, seq_len = i.shape[0], i.shape[1]
+            with torch.no_grad():
+                y_pred = tracknet(x).detach().cpu()
+            
+            y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
+            ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
+            ensemble_y_pred = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
+
+            for b in range(b_size):
+                if sample_count < buffer_size:
+                    # Incomplete buffer
+                    y_pred = y_pred_buffer[batch_i+b, frame_i].sum(0) / (sample_count+1)
+                else:
+                    # General case
+                    y_pred = (y_pred_buffer[batch_i+b, frame_i] * weight[:, None, None]).sum(0)
+                
+                ensemble_i = torch.cat((ensemble_i, i[b][0].reshape(1, 1, 2)), dim=0)
+                ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
+                sample_count += 1
+
+                if sample_count == num_sample:
+                    # Last batch
+                    y_zero_pad = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
+                    y_pred_buffer = torch.cat((y_pred_buffer, y_zero_pad), dim=0)
+
+                    for f in range(1, seq_len):
+                        # Last input sequence
+                        y_pred = y_pred_buffer[batch_i+b+f, frame_i].sum(0) / (seq_len-f)
+                        ensemble_i = torch.cat((ensemble_i, i[-1][f].reshape(1, 1, 2)), dim=0)
+                        ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
+
+            # Predict
+            tmp_pred = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler)
+            for key in tmp_pred.keys():
+                tracknet_pred_dict[key].extend(tmp_pred[key])
+
+            # Update buffer, keep last predictions for ensemble in next iteration
+            y_pred_buffer = y_pred_buffer[-buffer_size:]
 
     # 如果使用InpaintNet
     if inpaintnet is not None:
@@ -151,24 +218,90 @@ def predict_from_images(image_dir, tracknet_file, inpaintnet_file='', batch_size
         tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, th_h=h*0.05)
         inpaint_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
 
-        # 创建数据集
-        dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='coordinate', pred_dict=tracknet_pred_dict, padding=True)
-        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+        if eval_mode == 'nonoverlap':
+            # Create dataset with non-overlap sampling
+            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='coordinate', pred_dict=tracknet_pred_dict, padding=True)
+            data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
-        for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
-            coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
-            with torch.no_grad():
-                coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
-                coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # replace predicted coordinates with inpainted coordinates
+            for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
+                coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
+                with torch.no_grad():
+                    coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
+                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # replace predicted coordinates with inpainted coordinates
+                
+                # Thresholding
+                th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
+                coor_inpaint[th_mask] = 0.
+                
+                # 预测
+                tmp_pred = predict(i, c_pred=coor_inpaint, img_scaler=img_scaler)
+                for key in tmp_pred.keys():
+                    inpaint_pred_dict[key].extend(tmp_pred[key])
+                
+        else:
+            # Create dataset with overlap sampling for temporal ensemble
+            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='coordinate', pred_dict=tracknet_pred_dict)
+            data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+            weight = get_ensemble_weight(seq_len, eval_mode)
+
+            # Init buffer params
+            num_sample, sample_count = len(dataset), 0
+            buffer_size = seq_len - 1
+            batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
+            frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
+            coor_inpaint_buffer = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
             
-            # 阈值处理
-            th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
-            coor_inpaint[th_mask] = 0.
-            
-            # 预测
-            tmp_pred = predict(i, c_pred=coor_inpaint, img_scaler=img_scaler)
-            for key in tmp_pred.keys():
-                inpaint_pred_dict[key].extend(tmp_pred[key])
+            for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
+                coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
+                b_size = i.shape[0]
+                with torch.no_grad():
+                    coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
+                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask)
+                
+                # Thresholding
+                th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
+                coor_inpaint[th_mask] = 0.
+
+                coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_inpaint), dim=0)
+                ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
+                ensemble_coor_inpaint = torch.empty((0, 1, 2), dtype=torch.float32)
+                
+                for b in range(b_size):
+                    if sample_count < buffer_size:
+                        # Incomplete buffer
+                        coor_inpaint = coor_inpaint_buffer[batch_i+b, frame_i].sum(0)
+                        coor_inpaint /= (sample_count+1)
+                    else:
+                        # General case
+                        coor_inpaint = (coor_inpaint_buffer[batch_i+b, frame_i] * weight[:, None]).sum(0)
+                    
+                    ensemble_i = torch.cat((ensemble_i, i[b][0].view(1, 1, 2)), dim=0)
+                    ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
+                    sample_count += 1
+
+                    if sample_count == num_sample:
+                        # Last input sequence
+                        coor_zero_pad = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
+                        coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_zero_pad), dim=0)
+                        
+                        for f in range(1, seq_len):
+                            coor_inpaint = coor_inpaint_buffer[batch_i+b+f, frame_i].sum(0)
+                            coor_inpaint /= (seq_len-f)
+                            ensemble_i = torch.cat((ensemble_i, i[-1][f].view(1, 1, 2)), dim=0)
+                            ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
+
+                # Thresholding
+                th_mask = ((ensemble_coor_inpaint[:, :, 0] < COOR_TH) & (ensemble_coor_inpaint[:, :, 1] < COOR_TH))
+                ensemble_coor_inpaint[th_mask] = 0.
+
+                # 预测
+                tmp_pred = predict(ensemble_i, c_pred=ensemble_coor_inpaint, img_scaler=img_scaler)
+                for key in tmp_pred.keys():
+                    inpaint_pred_dict[key].extend(tmp_pred[key])
+                
+                # Update buffer, keep last predictions for ensemble in next iteration
+                coor_inpaint_buffer = coor_inpaint_buffer[-buffer_size:]
+        
 
     # 写入CSV文件
     if not os.path.exists(save_dir):
@@ -195,9 +328,8 @@ def predict_from_images(image_dir, tracknet_file, inpaintnet_file='', batch_size
     # 如果需要生成视频
     if output_video:
         # 创建视频 - 使用原始图像作为基础
-        video_frames = frame_list.copy()
         video_file = os.path.join(save_dir, f'{img_dir_name}_prediction.mp4')
-        write_pred_video_with_images(video_frames, pred_dict, video_file, traj_len=traj_len)
+        write_pred_video_with_images(frame_list, pred_dict, video_file, traj_len=traj_len)
         print(f"Prediction video saved to {video_file}")
 
     return pred_dict
@@ -207,8 +339,6 @@ def write_pred_video_with_images(frame_list, pred_dict, save_file, traj_len=8):
     使用图像列表和预测结果创建带轨迹的视频
     """
     import cv2
-    from collections import deque
-    from utils.general import draw_traj
 
     # 获取图像尺寸
     h, w = frame_list[0].shape[:2]
@@ -219,7 +349,7 @@ def write_pred_video_with_images(frame_list, pred_dict, save_file, traj_len=8):
     out = cv2.VideoWriter(save_file, fourcc, fps, (w, h))
 
     # 创建轨迹队列
-    traj_queue = deque()
+    pred_queue = deque()
 
     # 遍历每一帧
     for i, frame in enumerate(frame_list):
@@ -230,8 +360,8 @@ def write_pred_video_with_images(frame_list, pred_dict, save_file, traj_len=8):
             frame_bgr = frame
 
         # 检查轨迹队列大小
-        if len(traj_queue) >= traj_len:
-            traj_queue.pop()
+        if len(pred_queue) >= traj_len:
+            pred_queue.pop()
 
         # 找到当前帧的预测结果
         current_pred = None
@@ -246,12 +376,12 @@ def write_pred_video_with_images(frame_list, pred_dict, save_file, traj_len=8):
 
         # 添加当前预测到轨迹队列
         if current_pred is not None:
-            traj_queue.appendleft(current_pred)
+            pred_queue.appendleft(current_pred)
         else:
-            traj_queue.appendleft(None)
+            pred_queue.appendleft(None)
 
         # 在帧上绘制轨迹
-        frame_with_traj = draw_traj(frame_bgr, traj_queue, color='yellow')
+        frame_with_traj = draw_traj(frame_bgr, pred_queue, color='yellow')
 
         # 写入视频
         out.write(frame_with_traj)
