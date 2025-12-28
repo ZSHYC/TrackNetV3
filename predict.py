@@ -155,8 +155,19 @@ if __name__ == '__main__':
         else:
             # Sample all frames from video
             frame_list = generate_frames(args.video_file)
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='heatmap', bg_mode=bg_mode,
-                                                 frame_arr=np.array(frame_list)[:, :, :, ::-1])
+            # 检查frame_list是否为空
+            if not frame_list or len(frame_list) == 0:
+                raise ValueError(f"No frames could be extracted from video file: {args.video_file}")
+            # 检查frame_list中的每一帧是否有效
+            for i, frame in enumerate(frame_list):
+                if frame is None:
+                    raise ValueError(f"Frame {i} is None, video file may be corrupted: {args.video_file}")
+            # 转换为numpy数组并检查维度
+            frame_array = np.array(frame_list)
+            if frame_array.ndim != 4:
+                raise ValueError(f"Expected 4D array for frames (N, H, W, C), but got {frame_array.ndim}D array with shape {frame_array.shape}. Video file: {args.video_file}")
+            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=bg_mode,
+                                                frame_arr=frame_array[:, :, :, ::-1], padding=True)
             data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
             video_len = len(frame_list)
         
