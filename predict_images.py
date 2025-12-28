@@ -70,6 +70,7 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
     
     return pred_dict    
 
+
 def predict_from_images(image_dir, tracknet_file, inpaintnet_file='', batch_size=16, eval_mode='weight', 
                         output_video=False, traj_len=8, save_dir='pred_result', img_format='png'):
     """
@@ -334,6 +335,62 @@ def predict_from_images(image_dir, tracknet_file, inpaintnet_file='', batch_size
 
     return pred_dict
 
+def predict_from_all_subfolders(root_dir, tracknet_file, inpaintnet_file='', batch_size=16, eval_mode='weight',
+                                output_video=False, traj_len=8, save_dir='pred_result', img_format='png'):
+    """
+    预测根目录下所有子文件夹中的图像序列
+    
+    Args:
+        root_dir (str): 包含多个子文件夹的根目录路径
+        tracknet_file (str): TrackNet模型检查点文件路径
+        inpaintnet_file (str): InpaintNet模型检查点文件路径
+        batch_size (int): 推理批次大小
+        eval_mode (str): 评估模式
+        output_video (bool): 是否输出带轨迹的视频
+        traj_len (int): 轨迹长度
+        save_dir (str): 保存结果的目录
+        img_format (str): 图像格式
+    """
+    print(f"Processing all subfolders in: {root_dir}")
+    
+    # 获取所有子文件夹
+    subfolders = [f for f in os.listdir(root_dir) 
+                  if os.path.isdir(os.path.join(root_dir, f))]
+    
+    if not subfolders:
+        print(f"No subfolders found in {root_dir}")
+        return
+    
+    print(f"Found {len(subfolders)} subfolders: {subfolders}")
+    
+    # 为每个子文件夹运行预测
+    for subfolder in subfolders:
+        subfolder_path = os.path.join(root_dir, subfolder)
+        print(f"\nProcessing subfolder: {subfolder_path}")
+        
+        try:
+            # 为每个子文件夹创建独立的保存目录
+            subfolder_save_dir = os.path.join(save_dir, subfolder)
+            
+            predict_from_images(
+                image_dir=subfolder_path,
+                tracknet_file=tracknet_file,
+                inpaintnet_file=inpaintnet_file,
+                batch_size=batch_size,
+                eval_mode=eval_mode,
+                output_video=output_video,
+                traj_len=traj_len,
+                save_dir=subfolder_save_dir,
+                img_format=img_format
+            )
+            
+            print(f"Completed processing: {subfolder}")
+        except Exception as e:
+            print(f"Error processing subfolder {subfolder}: {str(e)}")
+            continue
+    
+    print(f"\nCompleted processing all subfolders in {root_dir}")
+
 def write_pred_video_with_images(frame_list, pred_dict, save_file, traj_len=8):
     """
     使用图像列表和预测结果创建带轨迹的视频
@@ -401,16 +458,30 @@ if __name__ == '__main__':
     parser.add_argument('--img_format', type=str, default='png', help='image format (png, jpg, etc.)')
     parser.add_argument('--output_video', action='store_true', default=False, help='whether to output video with predicted trajectory')
     parser.add_argument('--traj_len', type=int, default=8, help='length of trajectory to draw on video')
+    parser.add_argument('--process_subfolders', action='store_true', default=False, help='whether to process all subfolders in the image_dir')
     args = parser.parse_args()
 
-    predict_from_images(
-        image_dir=args.image_dir,
-        tracknet_file=args.tracknet_file,
-        inpaintnet_file=args.inpaintnet_file,
-        batch_size=args.batch_size,
-        eval_mode=args.eval_mode,
-        output_video=args.output_video,
-        traj_len=args.traj_len,
-        save_dir=args.save_dir,
-        img_format=args.img_format
-    )
+    if args.process_subfolders:
+        predict_from_all_subfolders(
+            root_dir=args.image_dir,
+            tracknet_file=args.tracknet_file,
+            inpaintnet_file=args.inpaintnet_file,
+            batch_size=args.batch_size,
+            eval_mode=args.eval_mode,
+            output_video=args.output_video,
+            traj_len=args.traj_len,
+            save_dir=args.save_dir,
+            img_format=args.img_format
+        )
+    else:
+        predict_from_images(
+            image_dir=args.image_dir,
+            tracknet_file=args.tracknet_file,
+            inpaintnet_file=args.inpaintnet_file,
+            batch_size=args.batch_size,
+            eval_mode=args.eval_mode,
+            output_video=args.output_video,
+            traj_len=args.traj_len,
+            save_dir=args.save_dir,
+            img_format=args.img_format
+        )
