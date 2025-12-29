@@ -17,3 +17,4 @@ predict_old.py
 *.sh
 *.mp4
 game/
+results/

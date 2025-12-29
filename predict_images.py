@@ -355,3 +355,21 @@ if __name__ == '__main__':
             save_dir=args.save_dir,
             img_format=args.img_format
         ) 
+        
+        
+# 1. 处理单个图像文件夹：
+# python predict_images.py --image_dir path/to/your/images --tracknet_file ckpts/TrackNet_best.pt --inpaintnet_file ckpts/InpaintNet_best.pt --save_dir results --output_video
+
+# 2. 处理图像文件夹中的所有子文件夹：
+# python predict_images.py --image_dir path/to/your/images --tracknet_file ckpts/TrackNet_best.pt --inpaintnet_file ckpts/InpaintNet_best.pt --save_dir results --output_video --process_subfolders
+
+# 3. 完整参数示例：
+# python predict_images.py \
+#   --image_dir /path/to/images \
+#   --tracknet_file /path/to/tracknet_model.pth \
+#   --inpaintnet_file /path/to/inpaintnet_model.pth \
+#   --batch_size 16 \
+#   --eval_mode weight \
+#   --save_dir results \
+#   --output_video \
+#   --traj_len 8
